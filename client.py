@@ -98,8 +98,7 @@ class ZMQClient:
                     'pem_pub_key': b64encode(self.pem_pub_key).decode('utf-8')
                 }
                 json.dump(data, file_pointer)
-        exit(1)
-
+        
         self.ctx = zmq.Context()
         self.dealer = self.ctx.socket(zmq.DEALER)
         self.dealer_ctl = zmq.Poller()
