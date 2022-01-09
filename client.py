@@ -70,19 +70,35 @@ class ZMQClient:
     HSK = b'hsk'
     STS = b'sts'
 
-    def __init__(self, endpoint, pseudo, password, connection_type='SIGNIN'):
+    def __init__(self, endpoint, pseudo, password, connection_type='SIGNIN', secret='secret.json'):
         self.pseudo = pseudo 
         self.password = password 
         self.endpoint = endpoint 
         self.connection_type = connection_type
-
+        self.secret = secret
         logger.debug('rsa key generation ...!')
-        key = RSA.generate(2048)
-        self.pem_prv_key = key.export_key('PEM')
-        self.pem_pub_key = key.publickey().exportKey('PEM')
-    
-        self.pub_key = RSA.import_key(self.pem_pub_key)
-        self.prv_key = RSA.import_key(self.pem_prv_key)    
+        
+        if os.path.isfile(self.secret) and os.path.getsize(self.secret):
+            logger.debug(f'rsa key will be loaded from {self.secret}')
+            with open(self.secret, 'r') as file_pointer:
+                load_data = json.load(file_pointer)
+                self.pem_prv_key = b64decode(load_data['pem_prv_key'].encode('utf-8'))
+                self.pem_pub_key = b64decode(load_data['pem_pub_key'].encode('utf-8'))
+        else:
+            key = RSA.generate(2048)
+            self.pem_prv_key = key.export_key('PEM')
+            self.pem_pub_key = key.publickey().exportKey('PEM')
+        
+            self.pub_key = RSA.import_key(self.pem_pub_key)
+            self.prv_key = RSA.import_key(self.pem_prv_key)    
+
+            with open(self.secret, 'w') as file_pointer:
+                data = {
+                    'pem_prv_key': b64encode(self.pem_prv_key).decode('utf-8'), 
+                    'pem_pub_key': b64encode(self.pem_pub_key).decode('utf-8')
+                }
+                json.dump(data, file_pointer)
+        exit(1)
 
         self.ctx = zmq.Context()
         self.dealer = self.ctx.socket(zmq.DEALER)
@@ -144,9 +160,11 @@ class ZMQClient:
 @click.option('-s@', '--endpoint', help='server endpoint')
 @click.option('-ps', '--pseudo', help='pseudo of user')
 @click.option('-pw', '--password', help='pass of user')
-@click.option('-ct', '--connection_type', help='type of connection [SIGNIN or SIGNUP]')
-def enntrypoint(endpoint, pseudo, password, connection_type):
-    client = ZMQClient(endpoint, pseudo, password, connection_type)
+@click.option('-ct', '--connection_type', help='type of connection [SIGNIN or SIGNUP]', type=click.Choice(['SIGNIN', 'SIGNUP']), default='SIGNIN')
+@click.option('-sc', '--secret', help='path 2 secret.json', default='secret.json', type=click.Path())
+def enntrypoint(endpoint, pseudo, password, connection_type, secret):
+    client = ZMQClient(endpoint, pseudo, password, connection_type, secret)
+
     
 
 if __name__ == '__main__':
