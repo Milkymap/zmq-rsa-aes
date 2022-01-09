@@ -1,4 +1,5 @@
 import os 
+import cv2 
 import zmq 
 import click 
 
@@ -18,45 +19,8 @@ from Crypto.Random import get_random_bytes
 
 from loguru import logger 
 
-"""
-    A et B et C 
-        # asy : RSA (pub_key, prv_key)
-            $ robuste | slow 
-        # sym : AES (unq_key) 
-            $ robutes | fast 
-    
-    niang envoie sa clé publique a djim 
-    djim utilsie cette clé publique pour crypter la _unq_key 
-    djim envoie _unq_key a niang 
-
-    dembo recupere _unq_key en sniffant le reseau mais dembo ne peut dechiffrer _unq_key
-    niang recoit _unq_key et utilise prv_key pour dechiffrer _unq_key
-    niang obtient unq_key from _unq_key avec sa prv_key 
-
-    unq_key AES 
-
-    niang envoie pub_key au server qui le donne a djim 
-    djim envoie pub_key au server qui le donne à niang 
-
-    server envoie left or right a soit djim ou niang 
-
-    niang crée une partie de unq_key_left (128 bits)
-    djim crée la partie droite de clé unq_key_right(128 bits)
-
-    niang crypte avec la pub_key de djim, unq_key_left et lenvoie au server qui le donne a djim
-    djim crypte avec la pub_key de niang et envoie unq_key_right au server qui le donne a niang
-
-    niang peut utiliser sa prv_key pour dechiffrer unq_key_right et combiner 
-    unq_key_left avec unq_key_right pour avoir unq_key 
-
-    djim peut utiliser sa prv_key pour dechiffrer unq_key_left et combiner 
-    unq_key_left avec unq_key_right pour avoir unq_key 
-
-
-    djim et niang peuvent alors communiquer via unq_key par AES 
-"""
-
 class ZMQClient:
+
     TXT = b'txt'
     SND = b'snd'
     IMG = b'img'
@@ -65,10 +29,17 @@ class ZMQClient:
     JSN = b'jsn'
     PKL = b'pkl'
 
+    BEG = b'beg'
+    END = b'end'
+
     DLM = b''
+    
+    LNK = b'lnk'
+
     ERR = b'err'
     HSK = b'hsk'
     STS = b'sts'
+    EXT = b'ext'
 
     def __init__(self, endpoint, pseudo, password, connection_type='SIGNIN', secret='secret.json'):
         self.pseudo = pseudo 
@@ -76,6 +47,7 @@ class ZMQClient:
         self.endpoint = endpoint 
         self.connection_type = connection_type
         self.secret = secret
+        self.canals = {}
         logger.debug('rsa key generation ...!')
         
         if os.path.isfile(self.secret) and os.path.getsize(self.secret):
@@ -84,6 +56,9 @@ class ZMQClient:
                 load_data = json.load(file_pointer)
                 self.pem_prv_key = b64decode(load_data['pem_prv_key'].encode('utf-8'))
                 self.pem_pub_key = b64decode(load_data['pem_pub_key'].encode('utf-8'))
+
+                self.pub_key = RSA.import_key(self.pem_pub_key)
+                self.prv_key = RSA.import_key(self.pem_prv_key)        
         else:
             key = RSA.generate(2048)
             self.pem_prv_key = key.export_key('PEM')
@@ -119,7 +94,7 @@ class ZMQClient:
     def rsa_decryption(self, b64_cipher):
         decryptor = PKCS1_OAEP.new(self.prv_key)
         plain = decryptor.decrypt(b64decode(b64_cipher))
-        return plain.decode('utf-8')
+        return plain
 
     def aes_encryption(self, plain):
         pass 
@@ -128,7 +103,6 @@ class ZMQClient:
         pass 
 
     def make_hsk(self):
-        # _, action_type, _, serializer_type, _, encoded_data
         message2send = {
             'pseudo': self.pseudo, 
             'password': self.password, 
@@ -150,10 +124,122 @@ class ZMQClient:
         decoded_data = json.loads(incoming_data.decode())
         if decoded_data['status'] == 1:
             logger.success('handshake was performed successfully')
+            if self.connection_type == 'SIGNIN':
+                self.start()
+        
         else:
             logger.error('failed to make handshake')
         
-        print(decoded_data['message'])
+        logger.debug(decoded_data['message'])
+
+
+    def remove_ressources(self):
+        self.dealer_ctl.unregister(self.dealer)
+        self.dealer.close()
+        self.ctx.term()
+        logger.success('zmq was removed...!')
+
+    def get_list_of_contacts(self):
+        self.dealer.send_multipart([
+            ZMQClient.DLM, 
+            ZMQClient.STS, 
+            ZMQClient.DLM, 
+            ZMQClient.BYT, 
+            ZMQClient.DLM, 
+            ZMQClient.DLM 
+        ])
+    
+    def link_to(self, target_pseudo):
+        self.dealer.send_multipart([
+            ZMQClient.DLM, 
+            ZMQClient.LNK, 
+            ZMQClient.DLM, 
+            ZMQClient.JSN, 
+            ZMQClient.DLM, 
+            json.dumps({'type': 'request', 'source': self.pseudo, 'target': target_pseudo}).encode()
+        ])
+
+    def start(self):
+        try:
+            screen = '000'
+            cv2.namedWindow(screen, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(screen, 400, 400)
+
+            keep_loop = True 
+            while keep_loop:
+                incoming_events = dict(self.dealer_ctl.poll(10))
+                if self.dealer in incoming_events:
+                    if incoming_events[self.dealer] == zmq.POLLIN:
+                        _, action_type, _, serializer_type, _, encoded_data = self.dealer.recv_multipart()
+                            
+                        if serializer_type == ZMQClient.JSN:
+                            decoded_data = json.loads(encoded_data.decode())
+                        if serializer_type == ZMQClient.PKL:
+                            decoded_data = pickle.loads(encoded_data)
+                        if serializer_type == ZMQClient.BYT:
+                            decoded_data = encoded_data.decode()
+                        
+                        if action_type == ZMQClient.LNK:
+                            if decoded_data['type'] == 'question':
+                                if decoded_data['contents'] == 'canal?':
+                                    rep = input(f'do you want to be linked with {decoded_data["source"]} ?:')
+                                    self.dealer.send_multipart([
+                                        ZMQClient.DLM, 
+                                        ZMQClient.LNK, 
+                                        ZMQClient.DLM, 
+                                        ZMQClient.JSN, 
+                                        ZMQClient.DLM,   
+                                        json.dumps({
+                                            'type': 'response', 
+                                            'contents': rep, 
+                                            'source': decoded_data['source'], 
+                                            'target': self.pseudo
+                                        }).encode()                                  
+                                    ])
+                            
+                            
+                            if decoded_data['type'] == 'response':
+                               
+                                key = decoded_data['key']
+                                byte_key = key.encode('utf-8')
+                                plain_aes_key = self.rsa_decryption(byte_key)
+                                self.canals[decoded_data['target']] = plain_aes_key
+                                print(self.canals)
+
+                        if action_type == ZMQClient.STS:
+                            print(decoded_data)
+            # pseudo:message
+            # canals[pseudo] = aes_key
+            # aes_encrypt(message, aes_key)
+            # send ... branche 
+                        
+                key_code = cv2.waitKey(25) & 0xFF 
+                corresponding_char = chr(key_code)
+                if corresponding_char == 'l':
+                    self.get_list_of_contacts()
+                if corresponding_char == ' ':
+                    target_pseudo = input('pseudo:')
+                    logger.debug('...')
+                    print(target_pseudo)
+                    self.link_to(target_pseudo)
+
+
+
+            cv2.destroyAllWindows()
+        except KeyboardInterrupt as e:
+            pass 
+        except Exception as e:
+            logger.error(e)
+        finally:
+            self.dealer.send_multipart([
+                ZMQClient.DLM, 
+                ZMQClient.EXT, 
+                ZMQClient.DLM, 
+                ZMQClient.BYT, 
+                ZMQClient.DLM, 
+                self.pseudo.encode() 
+            ])
+            self.remove_ressources()
 
 @click.command()
 @click.option('-s@', '--endpoint', help='server endpoint')
@@ -163,7 +249,6 @@ class ZMQClient:
 @click.option('-sc', '--secret', help='path 2 secret.json', default='secret.json', type=click.Path())
 def enntrypoint(endpoint, pseudo, password, connection_type, secret):
     client = ZMQClient(endpoint, pseudo, password, connection_type, secret)
-
     
 
 if __name__ == '__main__':

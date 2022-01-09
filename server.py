@@ -34,10 +34,13 @@ class ZMQServer:
     END = b'end'
 
     DLM = b''
+    LNK = b'lnk'
 
     BYT = b'byt'
     JSN = b'jsn'
     PKL = b'pkl'
+
+    EXT = b'ext'
 
     def __init__(self, server_port, path2databse):
         self.rate = 0.3
@@ -52,6 +55,8 @@ class ZMQServer:
 
         self.path2database = path2databse
         self.memory_map = {}
+        self.connected_clients = {}  # pseudo to addr
+
         if os.path.isfile(self.path2database) and os.path.getsize(self.path2database) > 0:
             logger.debug(f'load database from {self.path2database}')
             with open(self.path2database, 'r', encoding='utf-8') as fp:
@@ -66,6 +71,9 @@ class ZMQServer:
         rsa_real_pubkey = PKCS1_OAEP.new(RSA.import_key(rsa_pem_pubkey))
         encrypted_data = rsa_real_pubkey.encrypt(encoded_data)
         return encrypted_data
+    
+    def toB64(self, data):
+        return b64encode(data).decode('utf-8')
 
     def generate_salt(self):
         return get_random_bytes(16)
@@ -78,7 +86,7 @@ class ZMQServer:
         if serializer_type == ZMQServer.BYT:
             return encoded_data.decode()
     
-    def perform_hsk(self, decoded_data):
+    def perform_hsk(self, client_addr, decoded_data):
         keys = ('pseudo', 'rsa_pubkey', 'password', 'connection_type')
         pseudo, rsa_pubkey, password, connection_type = op.itemgetter(*keys)(decoded_data)
         if connection_type == 'SIGNIN':
@@ -87,6 +95,7 @@ class ZMQServer:
                 joined_salt_password = ''.join([decoded_salt, password]).encode('utf-8')
                 hashed_password = hashlib.sha256(joined_salt_password).hexdigest()
                 if hashed_password == self.memory_map[pseudo]['hashed_password']:
+                    self.connected_clients[pseudo] = client_addr
                     return {'status': 1, 'message': 'handshake was performed...!'}
             return {'status': 0, 'message': 'your password is not valid'}
         if connection_type == 'SIGNUP':
@@ -104,7 +113,7 @@ class ZMQServer:
             }
             with open(self.path2database, 'w', encoding='utf-8') as fp:
                 json.dump(self.memory_map, fp)     
-                return {'status': 1}
+                return {'status': 1, 'message': 'signup was performed successfully'}
 
     def start(self):
         try:
@@ -125,13 +134,102 @@ class ZMQServer:
                         client_addr, _, action_type, _, serializer_type, _, encoded_data = incoming_data
                         decoded_data = self.deserialize(serializer_type, encoded_data)
                         if action_type == ZMQServer.HSK:
-                            response = self.perform_hsk(decoded_data)
+                            response = self.perform_hsk(client_addr, decoded_data)
                             self.router.send_multipart([client_addr, ZMQServer.DLM, ZMQServer.HSK, ZMQServer.DLM, ZMQServer.JSN, ZMQServer.DLM], flags=zmq.SNDMORE)
                             self.router.send_json(response)
                             if response['status'] == 1:
                                 logger.success('server perform handshake successfully')
                             else:
                                 logger.warning('server falied to perform handshake')
+                        
+                        if action_type == ZMQServer.EXT:
+                            decoded_pseudo = self.deserialize(serializer_type, encoded_data)
+                            logger.debug(f'{decoded_pseudo} want to exit')
+                            if decoded_pseudo in self.connected_clients:
+                                del self.connected_clients[decoded_pseudo]
+                        
+                        if action_type == ZMQServer.STS:
+                            pseudo_array = list(self.memory_map.keys())
+                            response = json.dumps({
+                                'contacts': pseudo_array,
+                                'conencted': list(self.connected_clients.keys())
+                            }).encode()
+                            self.router.send_multipart([
+                                client_addr, 
+                                ZMQServer.DLM,
+                                ZMQServer.STS, 
+                                ZMQServer.DLM,
+                                ZMQServer.JSN, 
+                                ZMQServer.DLM,
+                                response 
+                            ])
+                        
+                        if action_type == ZMQServer.LNK:
+                            decoded_data = self.deserialize(serializer_type, encoded_data)
+                            if decoded_data['type'] == 'request':
+                                if decoded_data['target'] in self.connected_clients:
+                                    data2send = {
+                                        'type': 'question', 
+                                        'contents': 'canal?',
+                                        'source': decoded_data['source']
+                                    }
+                                    self.router.send_multipart([
+                                        self.connected_clients[decoded_data['target']], 
+                                        ZMQServer.DLM,
+                                        ZMQServer.LNK, 
+                                        ZMQServer.DLM,
+                                        ZMQServer.JSN, 
+                                        ZMQServer.DLM,
+                                        json.dumps(data2send).encode()
+                                    ])
+                            
+                            if decoded_data['type'] == 'response':
+                                if decoded_data['contents'] == 'oui':
+                                    random_key = get_random_bytes(32)  
+                                    logger.success('AES key was created')
+
+                                    source_pub_key = self.memory_map[decoded_data['source']]['rsa_pubkey']
+                                    target_pub_key = self.memory_map[decoded_data['target']]['rsa_pubkey']
+
+                                    source_cipher_key = self.rsa_encryption(source_pub_key, random_key)
+                                    target_cipher_key = self.rsa_encryption(target_pub_key, random_key)
+                                    
+                                    source_cipher_key = self.toB64(source_cipher_key)
+                                    target_cipher_key = self.toB64(target_cipher_key)
+                                    logger.success('AES key was encrypted for both clients')
+
+                                    data2send_source = {
+                                        'type': 'response',
+                                        'target': decoded_data['target'],
+                                        'key': source_cipher_key
+                                    }
+
+
+                                    data2send_target = {
+                                        'type': 'response',
+                                        'target': decoded_data['source'],
+                                        'key': target_cipher_key
+                                    }
+                                    self.router.send_multipart([
+                                        self.connected_clients[decoded_data['source']],
+                                        ZMQServer.DLM,
+                                        ZMQServer.LNK, 
+                                        ZMQServer.DLM,
+                                        ZMQServer.JSN, 
+                                        ZMQServer.DLM,
+                                        json.dumps(data2send_source).encode()
+                                    ])
+
+                                    self.router.send_multipart([
+                                        self.connected_clients[decoded_data['target']],
+                                        ZMQServer.DLM,
+                                        ZMQServer.LNK, 
+                                        ZMQServer.DLM,
+                                        ZMQServer.JSN, 
+                                        ZMQServer.DLM,
+                                        json.dumps(data2send_target).encode()
+                                    ])
+
                 # end if ...! 
             # end loop ...! 
 
